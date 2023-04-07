@@ -3,6 +3,7 @@ package infoblox
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"regexp"
 
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
@@ -27,7 +28,8 @@ func resourceNetworkContainer() *schema.Resource {
 			},
 			"cidr": {
 				Type:        schema.TypeString,
-				Required:    true,
+				Optional:    true,
+				Computed:    true,
 				Description: "The network container's address, in CIDR format.",
 			},
 			"comment": {
@@ -36,19 +38,59 @@ func resourceNetworkContainer() *schema.Resource {
 				Optional:    true,
 				Description: "A description of the network container.",
 			},
+			"reserve_ip": {
+				Type:        schema.TypeInt,
+				Optional:    true,
+				Computed:    true,
+				Description: "The number of IP's you want to reserve in IPv4 Network.",
+			},
 			"ext_attrs": {
 				Type:        schema.TypeString,
 				Default:     "",
 				Optional:    true,
 				Description: "The Extensible attributes of the network container to be added/updated, as a map in JSON format",
 			},
+			"parent_cidr": {
+				Type:        schema.TypeString,
+				Optional:    true,
+				Description: "The parent network container block in cidr format to allocate from.",
+			},
+			"reserve_ipv6": {
+				Type:        schema.TypeInt,
+				Optional:    true,
+				Computed:    true,
+				Description: "The number of IP's you want to reserve in IPv6 Network",
+			},
+			"gateway": {
+				Type:        schema.TypeString,
+				Optional:    true,
+				Description: "Gateway's IP address of the network. By default, the first IP address is set as gateway address; if the value is 'none' then the network has no gateway.",
+				Computed:    true,
+				// TODO: implement full support for this field
+			},
+			"allocate_prefix_len": {
+				Type:        schema.TypeInt,
+				Optional:    true,
+				Default:     0,
+				Description: "Set the parameter's value > 0 to allocate next available network with corresponding prefix length from the network container defined by 'parent_cidr'",
+			},
 		},
 	}
 }
 
 func resourceNetworkContainerCreate(d *schema.ResourceData, m interface{}, isIPv6 bool) error {
-	nvName := d.Get("network_view").(string)
+	networkViewName := d.Get("network_view").(string)
+	parentCidr := d.Get("parent_cidr").(string)
+	prefixLen := d.Get("allocate_prefix_len").(int)
 	cidr := d.Get("cidr").(string)
+	reserveIPv4 := d.Get("reserve_ip").(int)
+	reserveIPv6 := d.Get("reserve_ipv6").(int)
+	if reserveIPv6 > 255 || reserveIPv6 < 0 {
+		return fmt.Errorf("reserve_ipv6 value must be in range 0..255")
+	}
+
+	gateway := d.Get("gateway").(string)
+
 	comment := d.Get("comment").(string)
 
 	extAttrJSON := d.Get("ext_attrs").(string)
@@ -67,20 +109,94 @@ func resourceNetworkContainerCreate(d *schema.ResourceData, m interface{}, isIPv
 		}
 	}
 
-	if cidr == "" || nvName == "" {
-		return fmt.Errorf(
-			"Tenant ID, network view's name and CIDR are required to create a network container")
-	}
-
+	ZeroMacAddr := "00:00:00:00:00:00"
 	connector := m.(ibclient.IBConnector)
 	objMgr := ibclient.NewObjectManager(connector, "Terraform", tenantID)
-	nc, err := objMgr.CreateNetworkContainer(nvName, cidr, isIPv6, comment, extAttrs)
-	if err != nil {
-		return fmt.Errorf(
-			"creation of IPv6 network container block failed in network view '%s': %s",
-			nvName, err.Error())
+
+	var network *ibclient.NetworkContainer
+	var err error
+	if cidr == "" && parentCidr != "" && prefixLen > 1 {
+		log.Printf("Finding parent network with CIDR \"%s\" in view \"%s\"\n", parentCidr, networkViewName)
+		container, err := objMgr.GetNetworkContainer(networkViewName, parentCidr, isIPv6, nil)
+		if err != nil {
+			return fmt.Errorf(
+				"(1) Allocation of network block within network container '%s' under network view '%s' failed: %s", parentCidr, networkViewName, err.Error())
+		}
+		log.Printf("Found network container \"%s\" for CIDR \"%s\" for view \"%s\"\n", container.Ref, parentCidr, networkViewName)
+
+		network, err = objMgr.AllocateNetworkContainer(networkViewName, parentCidr, isIPv6, uint(prefixLen), comment, extAttrs)
+		if err != nil {
+			return fmt.Errorf("(2) Allocation of network block failed in network view (%s) : %s", networkViewName, err)
+		}
+		log.Printf("Allocated network container \"%s\" with CIDR \"%s\"\n", network.Ref, network.Ref)
+		d.Set("cidr", network.Cidr)
+	} else if cidr != "" {
+		network, err = objMgr.CreateNetworkContainer(networkViewName, cidr, isIPv6, comment, extAttrs)
+		if err != nil {
+			return fmt.Errorf("Creation of network block failed in network view (%s) : %s", networkViewName, err)
+		}
+	} else {
+		return fmt.Errorf("Creation of network block failed: neither cidr nor parentCidr with allocate_prefix_len was specified.")
 	}
-	d.SetId(nc.Ref)
+	d.SetId(network.Ref)
+
+	autoAllocateGateway := gateway == ""
+
+	if !autoAllocateGateway && gateway != "none" {
+		_, err = objMgr.AllocateIP(networkViewName, network.Cidr, gateway, isIPv6, ZeroMacAddr, "", "", nil)
+		if err != nil {
+			return fmt.Errorf(
+				"reservation of the IP address '%s' in network block '%s' from network view '%s' failed: %s",
+				gateway, network.Cidr, networkViewName, err.Error())
+		}
+	}
+
+	if isIPv6 {
+		for i := 1; i <= reserveIPv6; i++ {
+			reservedDuid := fmt.Sprintf("00:%.2x", i)
+			newAddr, err := objMgr.AllocateIP(
+				networkViewName, network.Cidr, "", isIPv6, reservedDuid, "", "", nil)
+			if err != nil {
+				return fmt.Errorf(
+					"reservation in network block '%s' from network view '%s' failed: %s",
+					network.Cidr, networkViewName, err.Error())
+			}
+			if autoAllocateGateway && i == 1 {
+				gateway = newAddr.IPv6Address
+			}
+		}
+	} else {
+		for i := 1; i <= reserveIPv4; i++ {
+			newAddr, err := objMgr.AllocateIP(
+				networkViewName, network.Cidr, "", isIPv6, ZeroMacAddr, "", "", nil)
+			if err != nil {
+				return fmt.Errorf(
+					"reservation in network block '%s' from network view '%s' failed: %s",
+					network.Cidr, networkViewName, err.Error())
+			}
+			if autoAllocateGateway && i == 1 {
+				gateway = newAddr.IPv4Address
+			}
+		}
+	}
+
+	d.Set("gateway", gateway)
+
+	//nvName := networkViewName
+	//if cidr == "" || nvName == "" {
+	//	return fmt.Errorf(
+	//		"Tenant ID, network view's name and CIDR are required to create a network container")
+	//}
+	//
+	//connector := m.(ibclient.IBConnector)
+	//objMgr := ibclient.NewObjectManager(connector, "Terraform", tenantID)
+	//nc, err := objMgr.CreateNetworkContainer(nvName, cidr, isIPv6, comment, extAttrs)
+	//if err != nil {
+	//	return fmt.Errorf(
+	//		"creation of IPv6 network container block failed in network view '%s': %s",
+	//		nvName, err.Error())
+	//}
+	//d.SetId(nc.Ref)
 
 	return nil
 }
